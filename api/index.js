@@ -60,6 +60,51 @@ function generateOTP() {
   return String(Math.floor(100000 + crypto.randomInt(900000))).padStart(6, '0');
 }
 
+// ── PAYMENT NOTIFICATION EMAIL ────────────────────────────────
+async function sendPaymentNotificationEmail({ playerName, paymentType, amountPaid, totalFee, balance, status, playerEmail, playerCell, coachName, teamName }) {
+  const notifyEmail = 'sajeeb@appsus.io';
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.warn('⚠️  EMAIL_USER / EMAIL_PASS not set — skipping payment notification email');
+    return;
+  }
+
+  const fmt = n => '$' + (parseFloat(n) || 0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const typeLabel = { full: 'Full Payment', deposit: 'Deposit', remainder: 'Remaining Balance', installment: 'Installment' }[paymentType] || paymentType;
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #dce3ec;border-radius:8px">
+      <div style="background:#0a1628;padding:16px 20px;border-radius:6px 6px 0 0;margin:-24px -24px 24px">
+        <h2 style="color:#fff;margin:0;font-size:1.1rem;letter-spacing:.05em;text-transform:uppercase">Ambassadors Baseball — Payment Received</h2>
+      </div>
+      <p style="color:#1a1a2e;font-size:.95rem;margin-bottom:20px">A payment has been successfully processed.</p>
+      <table style="width:100%;border-collapse:collapse;font-size:.9rem;margin-bottom:20px">
+        <tr style="background:#f4f6f9"><td style="padding:9px 12px;color:#5a6a7a;width:40%">Player Name</td><td style="padding:9px 12px;color:#0a1628;font-weight:700">${playerName || '—'}</td></tr>
+        <tr><td style="padding:9px 12px;color:#5a6a7a">Team</td><td style="padding:9px 12px;color:#0a1628">${teamName || '—'}</td></tr>
+        <tr style="background:#f4f6f9"><td style="padding:9px 12px;color:#5a6a7a">Coach</td><td style="padding:9px 12px;color:#0a1628">${coachName || '—'}</td></tr>
+        <tr><td style="padding:9px 12px;color:#5a6a7a">Player Email</td><td style="padding:9px 12px;color:#0a1628">${playerEmail || '—'}</td></tr>
+        <tr style="background:#f4f6f9"><td style="padding:9px 12px;color:#5a6a7a">Player Cell</td><td style="padding:9px 12px;color:#0a1628">${playerCell || '—'}</td></tr>
+        <tr><td style="padding:9px 12px;color:#5a6a7a">Payment Type</td><td style="padding:9px 12px;color:#0a1628">${typeLabel}</td></tr>
+        <tr style="background:#f4f6f9"><td style="padding:9px 12px;color:#5a6a7a">Amount Paid</td><td style="padding:9px 12px;color:#2d7a2d;font-weight:700">${fmt(amountPaid)}</td></tr>
+        <tr><td style="padding:9px 12px;color:#5a6a7a">Total Fee</td><td style="padding:9px 12px;color:#0a1628">${fmt(totalFee)}</td></tr>
+        <tr style="background:#f4f6f9"><td style="padding:9px 12px;color:#5a6a7a">Remaining Balance</td><td style="padding:9px 12px;color:${parseFloat(balance) > 0 ? '#c8102e' : '#2d7a2d'};font-weight:700">${fmt(balance)}</td></tr>
+        <tr><td style="padding:9px 12px;color:#5a6a7a">Status</td><td style="padding:9px 12px;color:#0a1628;font-weight:700">${status || '—'}</td></tr>
+      </table>
+      <p style="color:#5a6a7a;font-size:.8rem;margin:0">This is an automated notification from Ambassadors Baseball.</p>
+    </div>`;
+
+  try {
+    await createTransporter().sendMail({
+      from: `"Ambassadors Baseball" <${process.env.EMAIL_USER}>`,
+      to: notifyEmail,
+      subject: `Payment Received — ${playerName || 'Player'} (${typeLabel})`,
+      html,
+    });
+    console.log(`📧  Payment notification email sent to ${notifyEmail}`);
+  } catch (err) {
+    console.error('⚠️  Failed to send payment notification email:', err.message);
+  }
+}
+
 // ── ENV VALIDATION ────────────────────────────────────────────────
 const REQUIRED_ENV = ['MONGODB_URI', 'JWT_SECRET'];
 // GHL_API_KEY / GHL_LOCATION_ID are optional — used only for contact upserts
@@ -144,6 +189,7 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
 
           await PlayerPayment.findByIdAndUpdate(playerPaymentId, update);
           console.log(`✅  Stripe payment recorded — playerPaymentId=${playerPaymentId} type=${paymentType}`);
+
         }
       } catch (dbErr) {
         console.error('❌  Failed to update PlayerPayment after Stripe webhook:', dbErr.message);
@@ -270,6 +316,7 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
                 installments_paid: installmentsPaid,
               });
               console.log(`✅  DB updated successfully — playerPaymentId=${playerPaymentId}`);
+
 
               // ── Handle second-to-last and last payment ────────────────
               // The problem: if the last billing cycle is shorter than 30 days
@@ -1696,6 +1743,40 @@ app.get('/api/teams/:id/installment-preview', async (req, res) => {
       paymentDeadline: financials.payment_deadline || '',
     });
   } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/send-payment-notification
+// Called by frontend after Stripe redirects back with ?payment=success
+// Body: { playerPaymentId }
+app.post('/api/send-payment-notification', async (req, res) => {
+  try {
+    const { playerPaymentId } = req.body;
+    if (!playerPaymentId) return res.status(400).json({ message: 'playerPaymentId is required' });
+
+    const pmt = await PlayerPayment.findById(playerPaymentId);
+    if (!pmt) return res.status(404).json({ message: 'Payment record not found' });
+
+    const playerRec = pmt.player_id ? await Player.findById(pmt.player_id).select('email cell') : null;
+    const coachRec  = pmt.coach_id  ? await Coach.findById(pmt.coach_id).select('first_name last_name team_name') : null;
+
+    await sendPaymentNotificationEmail({
+      playerName:  pmt.player_name    || '',
+      paymentType: pmt.status === 'Paid' ? 'full' : 'deposit',
+      amountPaid:  pmt.amount_paid    ?? 0,
+      totalFee:    pmt.total_fee      ?? 0,
+      balance:     pmt.balance        ?? 0,
+      status:      pmt.status         || '',
+      playerEmail: playerRec?.email   || '',
+      playerCell:  playerRec?.cell    || '',
+      coachName:   coachRec ? `${coachRec.first_name} ${coachRec.last_name}` : '',
+      teamName:    coachRec?.team_name || '',
+    });
+
+    res.json({ message: 'Notification sent' });
+  } catch (err) {
+    console.error('❌  send-payment-notification error:', err.message);
     res.status(500).json({ message: err.message });
   }
 });
