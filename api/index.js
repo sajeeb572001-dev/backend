@@ -729,11 +729,7 @@ async function deleteStripeProduct(productId) {
 async function updateStripeProductPrice(productId, amount, recurring = null) {
   if (!productId || !stripe) throw new Error('Stripe not configured or missing productId');
 
-  // Step 1 — Deactivate all existing active prices on this product
-  const existing = await stripe.prices.list({ product: productId, active: true, limit: 100 });
-  await Promise.all(existing.data.map(p => stripe.prices.update(p.id, { active: false })));
-
-  // Step 2 — Create new price under the same product
+  // Step 1 — Create new price first under the same product
   const priceParams = {
     product:     productId,
     unit_amount: Math.round(amount * 100),
@@ -747,8 +743,16 @@ async function updateStripeProductPrice(productId, amount, recurring = null) {
   }
   const newPrice = await stripe.prices.create(priceParams);
 
-  // Step 3 — Set new price as default on the product
+  // Step 2 — Set new price as default (removes old price as default so it can be deactivated)
   await stripe.products.update(productId, { default_price: newPrice.id });
+
+  // Step 3 — Now safely deactivate old prices (they are no longer the default)
+  const existing = await stripe.prices.list({ product: productId, active: true, limit: 100 });
+  await Promise.all(
+    existing.data
+      .filter(p => p.id !== newPrice.id)
+      .map(p => stripe.prices.update(p.id, { active: false }))
+  );
 
   console.log(`💰  Stripe price updated on product ${productId} → new priceId=${newPrice.id} $${amount}`);
   return newPrice.id;
