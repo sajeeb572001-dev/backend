@@ -1676,8 +1676,8 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
       }
 
     } catch (stripeErr) {
-      // Stripe errors are non-fatal — always fall through to the DB save
       console.error('⚠️  Stripe product sync error:', stripeErr.message);
+      return res.status(500).json({ message: 'Payment setup failed: ' + stripeErr.message });
     }
 
     // ── Persist to MongoDB ────────────────────────────────────
