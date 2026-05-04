@@ -5,7 +5,7 @@ const cors     = require('cors');
 const axios    = require('axios');
 const mongoose = require('mongoose');
 const FormData = require('form-data');
-const crypto   = require('crypto');å
+const crypto   = require('crypto');
 const nodemailer = require('nodemailer');
 const Stripe   = require('stripe');
 
