@@ -61,7 +61,7 @@ function generateOTP() {
 }
 
 // ── PAYMENT NOTIFICATION EMAIL ────────────────────────────────
-async function sendPaymentNotificationEmail({ playerName, paymentType, amountPaid, totalFee, balance, status, playerEmail, playerCell, coachName, teamName }) {
+async function sendPaymentNotificationEmail({ playerName, paymentType, amountPaid, totalFee, balance, status, playerEmail, playerCell, coachName, teamName, coachEmail }) {
   const notifyEmail = 'jahirul@appsus.io';
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
     console.warn('⚠️  EMAIL_USER / EMAIL_PASS not set — skipping payment notification email');
@@ -90,13 +90,14 @@ async function sendPaymentNotificationEmail({ playerName, paymentType, amountPai
       <p style="color:#5a6a7a;font-size:.8rem;margin:0">This is an automated notification from Ambassadors Baseball.</p>
     </div>`;
   try {
+    const recipients = [notifyEmail, coachEmail].filter(Boolean).join(', ');
     await createTransporter().sendMail({
       from: `"Ambassadors Baseball" <${process.env.EMAIL_USER}>`,
-      to: notifyEmail,
+      to: recipients,
       subject: `Payment Received — ${playerName || 'Player'} (${typeLabel})`,
       html,
     });
-    console.log(`📧  Payment notification email sent to ${notifyEmail}`);
+    console.log(`📧  Payment notification email sent to ${recipients}`);
   } catch (err) {
     console.error('⚠️  Failed to send payment notification email:', err.message);
   }
@@ -191,7 +192,7 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
           try {
             const updatedPmt = await PlayerPayment.findById(playerPaymentId);
             const playerRec  = updatedPmt?.player_id ? await Player.findById(updatedPmt.player_id).select('email cell') : null;
-            const coachRec   = updatedPmt?.coach_id  ? await Coach.findById(updatedPmt.coach_id).select('first_name last_name team_name') : null;
+            const coachRec   = updatedPmt?.coach_id  ? await Coach.findById(updatedPmt.coach_id).select('first_name last_name team_name email') : null;
             await sendPaymentNotificationEmail({
               playerName:  updatedPmt?.player_name || '',
               paymentType,
@@ -203,6 +204,7 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
               playerCell:  playerRec?.cell         || '',
               coachName:   coachRec ? `${coachRec.first_name} ${coachRec.last_name}` : '',
               teamName:    coachRec?.team_name     || '',
+              coachEmail:  coachRec?.email         || '',
             });
           } catch (emailErr) {
             console.error('⚠️  Payment notification email error (checkout):', emailErr.message);
@@ -1532,8 +1534,9 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
       ? Math.round((fee / months) * 100) / 100
       : fee;
 
-    // ── Did the player fee change since last save? ────────────
-    const feeChanged = !!existing && existing.player_fee !== fee;
+    // ── Did the player fee or deposit amount change since last save? ──
+    const feeChanged     = !!existing && existing.player_fee     !== fee;
+    const depositChanged = !!existing && existing.deposit_amount !== deposit;
 
     // ── Build the MongoDB update object ──────────────────────
     const update = {
@@ -1561,34 +1564,33 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
       update.stripe_product_installment = carry('stripe_product_installment');
       update.stripe_price_installment   = carry('stripe_price_installment');
 
-      // If fee changed — update prices on existing products (keep product IDs, never archive)
-      // Payment type changes (deposit on/off, monthly on/off) are handled per-product below
-      if (feeChanged && existing) {
-        console.log('💱  Fee changed — updating prices on existing Stripe products...');
+      // If fee or deposit changed — update prices on affected products only
+      if ((feeChanged || depositChanged) && existing) {
+        console.log('💱  Fee/deposit changed — updating prices on affected Stripe products...');
 
-        // Full pay — update price only if product exists and deposit is still OFF
-        if (existing.stripe_product_full && !depositEnabled) {
+        // Full pay — update only if fee changed and deposit is still OFF
+        if (feeChanged && existing.stripe_product_full && !depositEnabled) {
           const newPriceId = await updateStripeProductPrice(existing.stripe_product_full, fee);
           update.stripe_product_full = existing.stripe_product_full;
           update.stripe_price_full   = newPriceId;
         }
 
-        // Deposit — update price only if product exists and deposit is still ON
-        if (existing.stripe_product_deposit && depositEnabled && deposit > 0) {
+        // Deposit — update only if deposit amount changed and deposit is still ON
+        if (depositChanged && existing.stripe_product_deposit && depositEnabled && deposit > 0) {
           const newPriceId = await updateStripeProductPrice(existing.stripe_product_deposit, deposit);
           update.stripe_product_deposit = existing.stripe_product_deposit;
           update.stripe_price_deposit   = newPriceId;
         }
 
-        // Remainder — update price only if product exists and conditions still apply
-        if (existing.stripe_product_remainder && depositEnabled && remainder > 0 && !monthlyPayments) {
+        // Remainder — update if fee OR deposit changed (remainder = fee - deposit)
+        if ((feeChanged || depositChanged) && existing.stripe_product_remainder && depositEnabled && remainder > 0 && !monthlyPayments) {
           const newPriceId = await updateStripeProductPrice(existing.stripe_product_remainder, remainder);
           update.stripe_product_remainder = existing.stripe_product_remainder;
           update.stripe_price_remainder   = newPriceId;
         }
 
-        // Installment — just deactivate old prices, new prices created per-player at checkout
-        if (existing.stripe_product_installment && monthlyPayments) {
+        // Installment — deactivate old prices only if fee changed (installment is based on fee)
+        if (feeChanged && existing.stripe_product_installment && monthlyPayments) {
           const prices = await stripe.prices.list({ product: existing.stripe_product_installment, active: true, limit: 100 });
           await Promise.all(prices.data.map(p => stripe.prices.update(p.id, { active: false })));
           update.stripe_product_installment = existing.stripe_product_installment;
