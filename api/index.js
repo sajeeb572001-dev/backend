@@ -706,7 +706,9 @@ async function createStripeProductWithPrice(name, amount, recurring = null) {
 async function deleteStripeProduct(productId) {
   if (!productId || !stripe) return;
   try {
-    // Deactivate all active prices first
+    // Unset default_price first so prices can be safely deactivated
+    await stripe.products.update(productId, { default_price: '' });
+    // Deactivate all active prices
     const prices = await stripe.prices.list({ product: productId, active: true, limit: 100 });
     await Promise.all(prices.data.map(p => stripe.prices.update(p.id, { active: false })));
     // Archive the product itself
