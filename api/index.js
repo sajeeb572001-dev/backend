@@ -161,6 +161,18 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
           const today = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
           const update = {};
 
+          // ── BEFORE snapshot ───────────────────────────────────────
+          // Tells you exactly what the DB looked like and what Stripe just charged.
+          // Compare amount_paid_stripe vs total_fee_db — if they differ, the coach
+          // changed the fee between registration and checkout (Bug C territory).
+          console.log(
+            `🪝  [WEBHOOK] BEFORE — playerPaymentId=${playerPaymentId} type=${paymentType} ` +
+            `stripe_charged=${amountPaid} total_fee_db=${existing.total_fee || 0} ` +
+            `amount_paid_db=${existing.amount_paid || 0} balance_db=${existing.balance || 0} ` +
+            `status_db=${existing.status || ''} ` +
+            `mismatch=${paymentType !== 'installment' && amountPaid !== (existing.total_fee || 0) ? 'YES' : 'no'}`
+          );
+
           if (paymentType === 'deposit') {
             const newAmountPaid = (existing.amount_paid || 0) + amountPaid;
             const newBalance    = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
@@ -194,8 +206,38 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
             update.status      = newBalance <= 0 ? 'Paid' : 'Partial';
           }
 
+          // ── DECISION log ──────────────────────────────────────────
+          // What the new branch decided to write. If you're auditing whether the
+          // fix is doing what you expect, this is the line to read.
+          // Pre-fix behavior would always show wrote_amount_paid=<total_fee>.
+          // Post-fix: wrote_amount_paid should equal stripe_charged for full,
+          // and (prior amount_paid + stripe_charged) for remainder/installment/deposit.
+          console.log(
+            `🪝  [WEBHOOK] DECISION — playerPaymentId=${playerPaymentId} type=${paymentType} ` +
+            `wrote_amount_paid=${update.amount_paid ?? '(unchanged)'} ` +
+            `wrote_balance=${update.balance ?? '(unchanged)'} ` +
+            `wrote_status=${update.status ?? '(unchanged)'}`
+          );
+
           await PlayerPayment.findByIdAndUpdate(playerPaymentId, update);
           console.log(`✅  Stripe payment recorded — playerPaymentId=${playerPaymentId} type=${paymentType}`);
+
+          // ── AFTER verification ────────────────────────────────────
+          // Re-read from DB to confirm what actually persisted (defends against
+          // any silent schema rejection or hook side-effect).
+          try {
+            const verify = await PlayerPayment.findById(playerPaymentId).lean();
+            console.log(
+              `🪝  [WEBHOOK] AFTER — playerPaymentId=${playerPaymentId} ` +
+              `total_fee=${verify?.total_fee ?? 'n/a'} ` +
+              `amount_paid=${verify?.amount_paid ?? 'n/a'} ` +
+              `balance=${verify?.balance ?? 'n/a'} ` +
+              `status=${verify?.status ?? 'n/a'} ` +
+              `persisted=${verify && update.amount_paid !== undefined && verify.amount_paid === update.amount_paid ? 'OK' : 'CHECK'}`
+            );
+          } catch (verifyErr) {
+            console.error('⚠️  [WEBHOOK] Verification read failed:', verifyErr.message);
+          }
 
           // ── Send payment notification email ───────────────────
           try {
