@@ -170,13 +170,22 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
             update.balance           = newBalance;
             update.status            = newBalance <= 0 ? 'Paid' : 'Partial';
           } else if (paymentType === 'full' || paymentType === 'remainder') {
-            update.amount_paid = existing.total_fee;
-            update.balance     = 0;
-            update.status      = 'Paid';
-            if (paymentType === 'deposit') {
-              update.deposit_paid      = true;
-              update.deposit_paid_date = today;
-            }
+            // Use the ACTUAL amount Stripe charged (session.amount_total via amountPaid),
+            // not the stored total_fee. They almost always match, but if the coach
+            // republished the budget between PlayerPayment creation and checkout,
+            // Stripe will have charged the live price while total_fee still reflects
+            // the snapshot. Recording the real charge keeps the DB in sync with the bank.
+            //
+            // 'full' overwrites (idempotent on duplicate webhooks — full pay always
+            // starts from amount_paid: 0). 'remainder' accumulates onto any prior
+            // deposit so the running total is correct.
+            const newAmountPaid = paymentType === 'full'
+              ? amountPaid
+              : (existing.amount_paid || 0) + amountPaid;
+            const newBalance    = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
+            update.amount_paid = newAmountPaid;
+            update.balance     = newBalance;
+            update.status      = newBalance <= 0 ? 'Paid' : 'Partial';
           } else if (paymentType === 'installment') {
             const newAmountPaid = (existing.amount_paid || 0) + amountPaid;
             const newBalance    = Math.max(0, (existing.total_fee || 0) - newAmountPaid);
