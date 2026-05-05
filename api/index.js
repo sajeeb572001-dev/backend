@@ -62,7 +62,7 @@ function generateOTP() {
 
 // ── PAYMENT NOTIFICATION EMAIL ────────────────────────────────
 async function sendPaymentNotificationEmail({ playerName, paymentType, amountPaid, totalFee, balance, status, playerEmail, playerCell, coachName, teamName, coachEmail }) {
-  const notifyEmail = 'jahirul@appsus.io';
+  const notifyEmails = ['jahirul@appsus.io', 'sajeeb@appsus.io'];
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
     console.warn('⚠️  EMAIL_USER / EMAIL_PASS not set — skipping payment notification email');
     return;
@@ -90,7 +90,7 @@ async function sendPaymentNotificationEmail({ playerName, paymentType, amountPai
       <p style="color:#5a6a7a;font-size:.8rem;margin:0">This is an automated notification from Ambassadors Baseball.</p>
     </div>`;
   try {
-    const recipients = [notifyEmail, coachEmail].filter(Boolean).join(', ');
+    const recipients = [...notifyEmails, coachEmail].filter(Boolean).join(', ');
     await createTransporter().sendMail({
       from: `"Ambassadors Baseball" <${process.env.EMAIL_USER}>`,
       to: recipients,
@@ -136,7 +136,7 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const { playerPaymentId, paymentType, coachId } = session.metadata || {};
+    let { playerPaymentId, pendingId, paymentType, coachId } = session.metadata || {};
     const amountPaid = session.amount_total / 100; // cents → dollars
 
     // ── Installment subscription: set cancel_at_period_end as a safety net ─
@@ -151,6 +151,117 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         }
       } catch (subErr) {
         console.error('⚠️  Failed to log installment setup:', subErr.message);
+      }
+    }
+
+    // ── PENDING REGISTRATION → materialize Player + PlayerPayment ─────────
+    // If this checkout came from a pre-payment registration form, no Player or
+    // PlayerPayment exists yet. Create them now, push to GHL, then continue
+    // into the existing PlayerPayment update flow with the freshly-minted id.
+    if (pendingId && !playerPaymentId) {
+      try {
+        const pending = await PendingRegistration.findById(pendingId).lean();
+        if (!pending) {
+          console.error(`❌  [WEBHOOK] PendingRegistration ${pendingId} not found — payment received but no record to materialize. Manual reconciliation needed for session ${session.id}.`);
+        } else {
+          const p = pending.player_payload || {};
+          console.log(`📦  [WEBHOOK] Materializing pending registration ${pendingId} for player="${p.name}"`);
+
+          // 1. Create the Player record
+          const player = await Player.create({
+            coach_id:     pending.coach_id,
+            name:         p.name        || '',
+            jersey:       p.jersey      || '',
+            jersey_2:     p.jersey2     || '',
+            grad_year:    p.gradYear    || '',
+            position:     p.position    || '',
+            pos2:         p.pos2        || '',
+            hw:           p.hw          || '',
+            city:         p.city        || '',
+            state:        p.state       || '',
+            address:      p.address     || '',
+            zip:          p.zip         || '',
+            email:        p.email       || '',
+            cell:         p.cell        || '',
+            dob:          p.dob         || '',
+            bats:         p.bats        || '',
+            throws:       p.throws      || '',
+            high_school:  p.highSchool  || '',
+            mother_first: p.motherFirst || '',
+            mother_last:  p.motherLast  || '',
+            mother_cell:  p.motherCell  || '',
+            mother_email: p.motherEmail || '',
+            father_first: p.fatherFirst || '',
+            father_last:  p.fatherLast  || '',
+            father_cell:  p.fatherCell  || '',
+            father_email: p.fatherEmail || '',
+          });
+          console.log(`✅  [WEBHOOK] Player created — playerId=${player._id}`);
+
+          // 2. Create the PlayerPayment record (status: Pending — the rest of the
+          // webhook flow below will flip it to Paid/Partial with the real amount).
+          const playerPayment = await PlayerPayment.create({
+            coach_id:         pending.coach_id,
+            player_id:        player._id,
+            player_name:      p.name || '',
+            total_fee:        pending.total_fee      || 0,
+            deposit_amount:   pending.deposit_amount || 0,
+            deposit_paid:     false,
+            payment_plan:     pending.payment_plan   || [],
+            amount_paid:      0,
+            balance:          pending.total_fee      || 0,
+            status:           'Pending',
+            registered_date:  pending.registered_date || '',
+            payment_deadline: pending.payment_deadline || '',
+          });
+          console.log(`✅  [WEBHOOK] PlayerPayment created — playerPaymentId=${playerPayment._id}`);
+
+          // 3. Push to GHL (best-effort — never blocks the materialization).
+          try {
+            await upsertGHLPlayer({
+              name:        p.name,
+              email:       p.email,
+              cell:        p.cell,
+              dob:         p.dob,
+              bats:        p.bats,
+              throws:      p.throws,
+              hw:          p.hw,
+              jersey:      p.jersey,
+              jersey2:     p.jersey2,
+              gradYear:    p.gradYear,
+              position:    p.position,
+              pos2:        p.pos2,
+              address:     p.address,
+              city:        p.city,
+              state:       p.state,
+              zip:         p.zip,
+              highSchool:  p.highSchool,
+              motherFirst: p.motherFirst,
+              motherLast:  p.motherLast,
+              motherCell:  p.motherCell,
+              motherEmail: p.motherEmail,
+              fatherFirst: p.fatherFirst,
+              fatherLast:  p.fatherLast,
+              fatherCell:  p.fatherCell,
+              fatherEmail: p.fatherEmail,
+              teamName:    pending.team_name || '',
+            });
+          } catch (ghlErr) {
+            // Already logged inside upsertGHLPlayer; swallow so DB stays consistent.
+            console.error('⚠️  [WEBHOOK] GHL push failed but DB records created:', ghlErr.message);
+          }
+
+          // 4. Delete the pending row — we no longer need it.
+          await PendingRegistration.findByIdAndDelete(pendingId);
+          console.log(`🗑️   [WEBHOOK] PendingRegistration ${pendingId} deleted`);
+
+          // 5. Hand off to the existing PlayerPayment update flow below.
+          playerPaymentId = String(playerPayment._id);
+        }
+      } catch (matErr) {
+        console.error('❌  [WEBHOOK] Materialization error:', matErr.message);
+        // Do not throw — let Stripe see a 200 so it doesn't keep retrying.
+        // The pending row is preserved (we didn't delete it) so manual recovery is possible.
       }
     }
 
@@ -667,6 +778,30 @@ const budgetSchema = new mongoose.Schema({
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 budgetSchema.index({ coach_id: 1 });
 
+// ── PENDING REGISTRATION (pre-payment holding area) ──────────────
+// Holds the registration form payload while the parent is at Stripe checkout.
+// Materialized into Player + PlayerPayment + GHL push only after the
+// checkout.session.completed webhook fires. Auto-expires after 24h via TTL.
+const pendingRegistrationSchema = new mongoose.Schema({
+  coach_id:        { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
+  // Snapshot of every field the registration form may submit. Stored loosely
+  // because two frontend forms (team.html and player-registration.html) submit
+  // slightly different field sets — we accept whatever shows up.
+  player_payload:  { type: Object, default: {} },
+  // Snapshot of fee/deposit at submit time — used to create PlayerPayment after checkout.
+  total_fee:       { type: Number, default: 0 },
+  deposit_amount:  { type: Number, default: 0 },
+  payment_plan:    { type: Array,  default: [] },
+  payment_deadline:{ type: String, default: '' },
+  registered_date: { type: String, default: '' },
+  team_name:       { type: String, default: '' },
+  // TTL — auto-delete after 24 hours from creation.
+  expires_at:      { type: Date,   default: () => new Date(Date.now() + 24 * 60 * 60 * 1000) },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
+pendingRegistrationSchema.index({ coach_id: 1 });
+// MongoDB TTL index — documents are removed when expires_at is reached.
+pendingRegistrationSchema.index({ expires_at: 1 }, { expireAfterSeconds: 0 });
+
 // ── MODELS ────────────────────────────────────────────────────────
 const Coach              = mongoose.model('Coach',              coachSchema);
 const Tryout             = mongoose.model('Tryout',             tryoutSchema);
@@ -676,6 +811,7 @@ const Schedule           = mongoose.model('Schedule',           scheduleSchema);
 const TeamFinancials     = mongoose.model('TeamFinancials',     teamFinancialsSchema);
 const PlayerPayment      = mongoose.model('PlayerPayment',      playerPaymentSchema);
 const Budget             = mongoose.model('Budget',             budgetSchema);
+const PendingRegistration= mongoose.model('PendingRegistration', pendingRegistrationSchema);
 
 // ════════════════════════════════════════════════════════════════
 //  GHL HELPERS
@@ -1832,9 +1968,26 @@ app.post('/api/checkout', async (req, res) => {
   if (!stripe) return res.status(500).json({ message: 'Stripe is not configured on the server' });
 
   try {
-    const { coachId, paymentType, playerPaymentId, successUrl, cancelUrl } = req.body;
-    if (!coachId || !paymentType || !playerPaymentId) {
-      return res.status(400).json({ message: 'coachId, paymentType, and playerPaymentId are required' });
+    // pendingId — new pre-payment flow (no Player/PlayerPayment exists yet, materialized by webhook)
+    // playerPaymentId — legacy/coach-side flow (Player + PlayerPayment already exist, webhook updates them)
+    // Exactly one must be supplied.
+    const { coachId, paymentType, playerPaymentId, pendingId, successUrl, cancelUrl } = req.body;
+    if (!coachId || !paymentType) {
+      return res.status(400).json({ message: 'coachId and paymentType are required' });
+    }
+    if (!playerPaymentId && !pendingId) {
+      return res.status(400).json({ message: 'Either playerPaymentId or pendingId is required' });
+    }
+
+    // If a pendingId was passed, verify it exists and belongs to this coach.
+    if (pendingId) {
+      const pending = await PendingRegistration.findById(pendingId).lean();
+      if (!pending) {
+        return res.status(404).json({ message: 'Pending registration not found or expired. Please resubmit the form.' });
+      }
+      if (String(pending.coach_id) !== String(coachId)) {
+        return res.status(403).json({ message: 'Pending registration does not belong to this team.' });
+      }
     }
 
     // ── Get stored Stripe price IDs from financials ───────────
@@ -1991,7 +2144,9 @@ app.post('/api/checkout', async (req, res) => {
       success_url: successUrl || `${req.headers.origin || 'https://yoursite.com'}?payment=success`,
       cancel_url:  cancelUrl  || `${req.headers.origin || 'https://yoursite.com'}?payment=cancelled`,
       metadata: {
-        playerPaymentId,
+        // One of these will be set; the webhook handles both cases.
+        ...(playerPaymentId ? { playerPaymentId } : {}),
+        ...(pendingId       ? { pendingId       } : {}),
         paymentType,
         coachId,
         ...(paymentType === 'installment' ? {
@@ -2002,12 +2157,13 @@ app.post('/api/checkout', async (req, res) => {
       },
     };
 
-    // For installments: store playerPaymentId on the subscription itself
+    // For installments: store ids on the subscription itself
     // so the customer.subscription.deleted webhook can link back to the player
     if (paymentType === 'installment') {
       sessionParams.subscription_data = {
         metadata: {
-          playerPaymentId,
+          ...(playerPaymentId ? { playerPaymentId } : {}),
+          ...(pendingId       ? { pendingId       } : {}),
           coachId,
           totalMonths:    String(req._installmentTotalMonths || 0),
           remainderCents: String(req._installmentRemainderCents || 0),
@@ -2382,6 +2538,53 @@ app.get('/api/teams/:id/roster', async (req, res) => {
     res.json({ players: players.map(normalizePlayer) });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── PENDING REGISTRATION (used by public registration forms) ─────
+// Replaces the old "create Player + create PlayerPayment up front" pattern.
+// The form payload is stashed here, the _id is handed to Stripe checkout in
+// session metadata, and the webhook materializes Player + PlayerPayment + GHL
+// only after payment succeeds. Abandoned pendings auto-expire via TTL (24h).
+app.post('/api/registrations/pending', async (req, res) => {
+  try {
+    const {
+      coachId,
+      // Player payload — accepts every field both registration forms send.
+      name, jersey, jersey2, gradYear, position, pos2, hw, city, state,
+      address, zip, email, cell, dob, bats, throws, highSchool,
+      motherFirst, motherLast, motherCell, motherEmail,
+      fatherFirst, fatherLast, fatherCell, fatherEmail,
+      teamName,
+      // Payment-snapshot fields — captured at submit time so we know what
+      // the parent saw and agreed to.
+      totalFee, depositAmount, paymentPlan, paymentDeadline, registeredDate,
+    } = req.body;
+
+    if (!coachId) return res.status(400).json({ message: 'coachId is required' });
+    if (!name)    return res.status(400).json({ message: 'Player name is required' });
+
+    const pending = await PendingRegistration.create({
+      coach_id:        coachId,
+      player_payload:  {
+        name, jersey, jersey2, gradYear, position, pos2, hw, city, state,
+        address, zip, email, cell, dob, bats, throws, highSchool,
+        motherFirst, motherLast, motherCell, motherEmail,
+        fatherFirst, fatherLast, fatherCell, fatherEmail,
+      },
+      total_fee:       Number(totalFee)      || 0,
+      deposit_amount:  Number(depositAmount) || 0,
+      payment_plan:    Array.isArray(paymentPlan) ? paymentPlan : [],
+      payment_deadline:paymentDeadline || '',
+      registered_date: registeredDate  || new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+      team_name:       teamName        || '',
+    });
+
+    console.log(`📥  PendingRegistration created — pendingId=${pending._id} player="${name}" coachId=${coachId}`);
+    res.status(201).json({ message: 'Pending registration created', pendingId: pending._id });
+  } catch (err) {
+    console.error('❌  PendingRegistration create error:', err.message);
+    res.status(500).json({ message: err.message });
   }
 });
 
