@@ -1577,11 +1577,17 @@ app.post('/api/coach/financials', requireAuth, async (req, res) => {
           update.stripe_price_full   = newPriceId;
         }
 
-        // Deposit — update only if deposit amount changed and deposit is still ON
-        if (depositChanged && existing.stripe_product_deposit && depositEnabled && deposit > 0) {
-          const newPriceId = await updateStripeProductPrice(existing.stripe_product_deposit, deposit);
+        // Deposit — always reuse the existing deposit product when deposit is still ON.
+        // Only create a new Stripe price when the deposit AMOUNT changed; if only the
+        // fee changed (deposit amount unchanged) keep the existing price as-is so we
+        // don't orphan the deposit product in Stripe.
+        if (existing.stripe_product_deposit && depositEnabled && deposit > 0) {
           update.stripe_product_deposit = existing.stripe_product_deposit;
-          update.stripe_price_deposit   = newPriceId;
+          if (depositChanged) {
+            update.stripe_price_deposit = await updateStripeProductPrice(existing.stripe_product_deposit, deposit);
+          } else {
+            update.stripe_price_deposit = existing.stripe_price_deposit || '';
+          }
         }
 
         // Remainder — update if fee OR deposit changed (remainder = fee - deposit)
