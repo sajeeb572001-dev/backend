@@ -260,8 +260,9 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         }
       } catch (matErr) {
         console.error('❌  [WEBHOOK] Materialization error:', matErr.message);
-        // Do not throw — let Stripe see a 200 so it doesn't keep retrying.
-        // The pending row is preserved (we didn't delete it) so manual recovery is possible.
+        // Return 500 so Stripe retries automatically (up to 17 times over 3 days).
+        // The pending row is preserved (we didn't delete it) so each retry is safe.
+        return res.status(500).send('Materialization failed — will retry');
       }
     }
 
@@ -795,8 +796,10 @@ const pendingRegistrationSchema = new mongoose.Schema({
   payment_deadline:{ type: String, default: '' },
   registered_date: { type: String, default: '' },
   team_name:       { type: String, default: '' },
-  // TTL — auto-delete after 24 hours from creation.
-  expires_at:      { type: Date,   default: () => new Date(Date.now() + 24 * 60 * 60 * 1000) },
+  // TTL — auto-delete after 48 hours from creation.
+  // 48hrs gives breathing room vs Stripe's 24hr session expiry —
+  // ensures the pending record outlives the checkout session in all cases.
+  expires_at:      { type: Date,   default: () => new Date(Date.now() + 48 * 60 * 60 * 1000) },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 pendingRegistrationSchema.index({ coach_id: 1 });
 // MongoDB TTL index — documents are removed when expires_at is reached.
